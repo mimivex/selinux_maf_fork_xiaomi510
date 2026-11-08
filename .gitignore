@@ -13,6 +13,7 @@
 *.la
 *.lo
 *.txt
+
 # Binary
 *.bin
 *.elf
@@ -25,3 +26,9 @@
 *.bak
 *_test
 *.bat
+
+# KernelPatch build stamp (written by the Makefile, depends on EXTRA_CFLAGS)
+.buildflags
+
+# CI output directory
+target/

@@ -40,12 +40,21 @@ CFLAGS = -Wall -O0 \
 
 CFLAGS += -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
 CFLAGS += -std=gnu99
+CFLAGS += $(EXTRA_CFLAGS)
 
 INCLUDE_DIRS := . include patch/include linux linux/include linux/security/selinux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
 objs := selinux_hook.o
+
+# Rebuild when the extra flags change, so a 'make debug' object can never be
+# relinked under the normal name.
+.buildflags: FORCE
+	@printf '%s\n' '$(EXTRA_CFLAGS)' > $@.tmp; \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+$(objs): .buildflags
 
 all: selinux_hook_$(SELINUX_VERSION).kpm
 
@@ -58,7 +67,34 @@ endif
 %.o: %.c
 	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
 
-.PHONY: clean
+.PHONY: clean debug debug-noredirect debug-snapshotonly FORCE
 clean:
 	rm -rf *.kpm
 	find . -name "*.o" | xargs rm -f
+
+# Diagnostic build: same module plus DIAG tracing around the rare hooks and a
+# stall watchdog that fires sysrq t/l when the kernel stops making progress.
+# Produces selinux_hook_$(SELINUX_VERSION)-debug.kpm (KPM version 1.1.9.2-debug)
+# and leaves the normal build in place.
+debug:
+	$(MAKE) EXTRA_CFLAGS="-DSELINUX_DIAG_TRACE=1 -DSELINUX_DIAG_WATCHDOG=1" all
+	cp selinux_hook_$(SELINUX_VERSION).kpm selinux_hook_$(SELINUX_VERSION)-debug.kpm
+	$(MAKE) all
+
+# Bisect build: same hooks and DIAG tracing, but the clean-policydb snapshot and
+# the per-task clean-eval scope are compiled out, so every AV computation runs
+# on the live policydb.  Tells us whether the freeze comes from the redirect or
+# from merely having the hooks installed.
+debug-noredirect:
+	$(MAKE) EXTRA_CFLAGS="-DSELINUX_DIAG_TRACE=1 -DSELINUX_DIAG_WATCHDOG=1 -DSELINUX_DIAG_NO_REDIRECT=1" all
+	cp selinux_hook_$(SELINUX_VERSION).kpm selinux_hook_$(SELINUX_VERSION)-debug-noredirect.kpm
+	$(MAKE) all
+
+# Bisect level 3: the clean policydb is still snapshotted, but no task enters a
+# clean-eval scope, so nothing ever hands the clean policydb to
+# context_struct_compute_av().  Separates "building the clean policydb" from
+# "redirecting callers onto it".
+debug-snapshotonly:
+	$(MAKE) EXTRA_CFLAGS="-DSELINUX_DIAG_TRACE=1 -DSELINUX_DIAG_WATCHDOG=1 -DSELINUX_DIAG_SNAPSHOT_ONLY=1" all
+	cp selinux_hook_$(SELINUX_VERSION).kpm selinux_hook_$(SELINUX_VERSION)-debug-snapshotonly.kpm
+	$(MAKE) all

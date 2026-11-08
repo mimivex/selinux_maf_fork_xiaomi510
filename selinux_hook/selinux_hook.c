@@ -24,15 +24,25 @@
 #include <kpmodule.h>
 #include <kputils.h>
 
-KPM_NAME("selinux_MAF_fork");
-KPM_VERSION("1.1.9.2");
+KPM_NAME("selinux_MAF_fork_xiaomi510");
+#if SELINUX_DIAG_SNAPSHOT_ONLY
+KPM_VERSION(SELINUX_VERSION "-debug-snapshotonly");
+#elif SELINUX_DIAG_TRACE && SELINUX_DIAG_NO_REDIRECT
+KPM_VERSION(SELINUX_VERSION "-debug-noredirect");
+#elif SELINUX_DIAG_TRACE
+KPM_VERSION(SELINUX_VERSION "-debug");
+#elif SELINUX_DIAG_NO_REDIRECT
+KPM_VERSION(SELINUX_VERSION "-noredirect");
+#else
+KPM_VERSION(SELINUX_VERSION);
+#endif
 KPM_LICENSE("GPL v3");
-KPM_AUTHOR("Admire, 741afb7");
+KPM_AUTHOR("Admire/741afb7/ddjjll87/mimivex");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
-#define CLEAN_POLICYDB_ALLOC_SIZE 0x4000
+#define CLEAN_POLICYDB_ALLOC_SIZE 0x10000
 #define SELINUX_LEGACY_BLOB_QUERY_MAX VERSION(4, 15, 0)
 #define contains_case_literal(s, len, lit) contains_case_lit((s), (len), (lit), sizeof(lit) - 1)
 
@@ -139,6 +149,7 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, 
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
 static void after_security_load_policy(hook_fargs4_t *a, void *u);
 static void try_load_clean_policydb_from_blob(const char *reason);
+static void snapshot_clean_policy(const char *reason);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
@@ -353,6 +364,245 @@ static bool should_bypass_clean_filter(uid_t uid)
     return false;
 }
 
+/*
+ * Diagnostic tracing, enabled only with -DSELINUX_DIAG_TRACE=1.
+ *
+ * The device freezes with no kernel diagnostics, so the only way to localize
+ * the stall is to bracket the rare hooks with entry/exit prints and emit a
+ * periodic tick from context_struct_compute_av().  The last DIAG line before
+ * dmesg goes silent names the call that never returned.
+ */
+#if SELINUX_DIAG_WATCHDOG
+/* Bumped by every hooked AV computation; read by the stall watchdog. */
+static u64 g_diag_progress;
+#endif
+
+#if SELINUX_DIAG_TRACE
+static u64 g_diag_seq;
+static u32 g_diag_av_count;
+
+static u64 diag_next(void)
+{
+    return ++g_diag_seq;
+}
+
+static void diag_av_tick(void)
+{
+    u32 n = ++g_diag_av_count;
+
+    if ((n & 0x1fff) == 0)
+        pr_info("[selinux_hook] DIAG tick av=%u uid=%d comm=%s in_scope=%d\n",
+                n, (int)current_uid(), current_comm(),
+                current_in_clean_eval_scope() ? 1 : 0);
+}
+#endif
+
+/*
+ * Stall watchdog, enabled only with -DSELINUX_DIAG_WATCHDOG=1 (the 'debug'
+ * build enables it together with SELINUX_DIAG_TRACE).
+ *
+ * The device dies with no oops and no stack trace, so correlation alone
+ * cannot tell which lock is held.  A kernel thread polls a progress counter
+ * bumped by every context_struct_compute_av(); if nothing moves for ~3 s it
+ * fires the kernel's own sysrq handlers, which dump every task's stack and
+ * all per-CPU backtraces into the ring buffer.  The kmsg stream already
+ * attached during capture writes them to the PC while they happen.
+ *
+ * The thread is started from module init, which runs at pre-kernel-init, so
+ * kthreadd already exists.  Everything is resolved through kallsyms; any
+ * missing symbol only disables that part of the watchdog.
+ */
+typedef int (*kthread_fn_t)(void *data);
+typedef void *(*kthread_create_on_node_fn_t)(kthread_fn_t fn, void *data,
+                                             int node, const char *namefmt, ...);
+typedef int (*wake_up_process_fn_t)(void *task);
+typedef void (*msleep_fn_t)(unsigned int msecs);
+typedef void (*handle_sysrq_fn_t)(int key);
+typedef void (*show_state_filter_fn_t)(unsigned long state);
+
+#if SELINUX_DIAG_WATCHDOG
+static volatile bool g_watchdog_stop;
+static void *g_watchdog_task;
+static kthread_create_on_node_fn_t g_kthread_create_fn;
+static wake_up_process_fn_t g_wake_up_process_fn;
+static msleep_fn_t g_msleep_fn;
+static handle_sysrq_fn_t g_handle_sysrq_fn;
+static show_state_filter_fn_t g_show_state_filter_fn;
+
+static void diag_watchdog_dump(void)
+{
+    pr_warn("[selinux_hook] DIAG WATCHDOG stalled: progress=%llu av=%u\n",
+            READ_ONCE(g_diag_progress), READ_ONCE(g_diag_av_count));
+
+    /* 't' prints every task, 'l' prints all per-CPU stacks. */
+    if (g_handle_sysrq_fn) {
+        g_handle_sysrq_fn('t');
+        g_handle_sysrq_fn('l');
+    } else if (g_show_state_filter_fn) {
+        g_show_state_filter_fn(0x2 /* TASK_UNINTERRUPTIBLE */);
+    } else {
+        pr_warn("[selinux_hook] DIAG WATCHDOG has no dump primitive available\n");
+    }
+}
+
+static int diag_watchdog_thread(void *data)
+{
+    u64 last = READ_ONCE(g_diag_progress);
+    bool armed = false; /* nothing is ever computed before boot reaches SELinux */
+    unsigned int quiet = 0;
+    unsigned int dumps = 0;
+    unsigned int ticks = 0;
+
+    pr_info("[selinux_hook] DIAG WATCHDOG thread started\n");
+    for (;;) {
+        u64 now;
+
+        if (READ_ONCE(g_watchdog_stop))
+            return 0;
+        if (g_msleep_fn)
+            g_msleep_fn(500);
+
+        now = READ_ONCE(g_diag_progress);
+        if (now != last) {
+            last = now;
+            quiet = 0;
+            dumps = 0; /* a quiet stretch that ended was not a freeze */
+            if (!armed) {
+                armed = true;
+                pr_info("[selinux_hook] DIAG WATCHDOG armed progress=%llu\n",
+                        now);
+            }
+            /* Alive line every ~10 s: if these stop, the whole box stopped. */
+            if ((++ticks % 20) == 0)
+                pr_info("[selinux_hook] DIAG WATCHDOG alive progress=%llu\n",
+                        now);
+            continue;
+        }
+
+        /* An idle kernel is normal; only a stall after progress is suspicious. */
+        if (!armed)
+            continue;
+
+        quiet++;
+        /* Six 500 ms windows without a single AV computation. */
+        if (quiet >= 6 && dumps < 3) {
+            dumps++;
+            diag_watchdog_dump();
+        } else if (quiet && (quiet % 20) == 0) {
+            pr_info("[selinux_hook] DIAG WATCHDOG still quiet for %u ms\n",
+                    quiet * 500);
+        }
+    }
+}
+
+static void diag_watchdog_start(void)
+{
+    g_kthread_create_fn = (kthread_create_on_node_fn_t)
+        lookup_name_optional_suffix("kthread_create_on_node");
+    g_wake_up_process_fn = (wake_up_process_fn_t)
+        lookup_name_optional_suffix("wake_up_process");
+    g_msleep_fn = (msleep_fn_t)lookup_name_optional_suffix("msleep");
+    g_handle_sysrq_fn = (handle_sysrq_fn_t)
+        lookup_name_optional_suffix("handle_sysrq");
+    if (!g_handle_sysrq_fn)
+        g_show_state_filter_fn = (show_state_filter_fn_t)
+            lookup_name_optional_suffix("show_state_filter");
+
+    pr_info("[selinux_hook] DIAG WATCHDOG symbols kthread=%px wake=%px msleep=%px sysrq=%px show_state=%px\n",
+            (void *)g_kthread_create_fn, (void *)g_wake_up_process_fn,
+            (void *)g_msleep_fn, (void *)g_handle_sysrq_fn,
+            (void *)g_show_state_filter_fn);
+
+    if (!g_kthread_create_fn || !g_wake_up_process_fn || !g_msleep_fn)
+        return;
+
+    g_watchdog_task = g_kthread_create_fn(diag_watchdog_thread, NULL, -1,
+                                          "kp_selinux_wd");
+    if (!g_watchdog_task) {
+        pr_warn("[selinux_hook] DIAG WATCHDOG kthread create failed\n");
+        return;
+    }
+    g_wake_up_process_fn(g_watchdog_task);
+}
+#endif
+
+/*
+ * Building the clean policydb means filp_open(), kernel_read(), vmalloc() and
+ * policydb_read() -- all of which may sleep.  It used to run from the
+ * context_struct_compute_av() hook on the first AV computation, but that
+ * function is reached through security_compute_av() under rcu_read_lock(),
+ * where scheduling is illegal.  On this kernel that is a direct route to a hard
+ * lockup with no log output.  Snapshot from a thread instead, and let the
+ * early AV computations stay fast.
+ */
+#ifndef SELINUX_ASYNC_SNAPSHOT
+#define SELINUX_ASYNC_SNAPSHOT 1
+#endif
+
+#if SELINUX_ASYNC_SNAPSHOT
+typedef int (*snap_kthread_fn_t)(void *data);
+typedef void *(*snap_kthread_create_fn_t)(snap_kthread_fn_t fn, void *data,
+                                          int node, const char *namefmt, ...);
+typedef int (*snap_wake_fn_t)(void *task);
+typedef void (*snap_msleep_fn_t)(unsigned int msecs);
+
+static void *g_snapshot_task;
+static bool g_snapshot_stop;
+
+static int clean_snapshot_thread(void *data)
+{
+    snap_msleep_fn_t sleep_fn =
+        (snap_msleep_fn_t)lookup_name_optional_suffix("msleep");
+    int i;
+
+    /* The Magisk-patched policy lands during boot; poll for it. */
+    for (i = 0; i < 300 && sleep_fn; i++) {
+        if (READ_ONCE(g_snapshot_stop))
+            return 0;
+        if (READ_ONCE(g_clean_policydb))
+            return 0;
+        if (READ_ONCE(g_clean_policy_blob)) {
+            try_load_clean_policydb_from_blob("async");
+            return 0;
+        }
+        sleep_fn(200);
+    }
+
+    if (!READ_ONCE(g_clean_policydb))
+        snapshot_clean_policy("async_fallback");
+    return 0;
+}
+
+static void start_clean_snapshot_thread(void)
+{
+    snap_kthread_create_fn_t create_fn;
+    snap_wake_fn_t wake_fn;
+
+    if (READ_ONCE(g_clean_policydb))
+        return;
+
+    create_fn = (snap_kthread_create_fn_t)
+        lookup_name_optional_suffix("kthread_create_on_node");
+    wake_fn = (snap_wake_fn_t)lookup_name_optional_suffix("wake_up_process");
+    if (!create_fn || !wake_fn) {
+        pr_warn("[selinux_hook] clean snapshot thread unavailable, falling back to in-hook snapshot\n");
+        snapshot_clean_policy("no_thread_fallback");
+        return;
+    }
+
+    g_snapshot_task = create_fn(clean_snapshot_thread, NULL, -1,
+                                "kp_selinux_snap");
+    if (!g_snapshot_task) {
+        pr_warn("[selinux_hook] clean snapshot thread create failed, falling back to in-hook snapshot\n");
+        snapshot_clean_policy("no_thread_fallback");
+        return;
+    }
+
+    wake_fn(g_snapshot_task);
+    pr_info("[selinux_hook] clean snapshot thread started\n");
+}
+#endif
+
 static bool use_legacy_clean_blob_query(void)
 {
     return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
@@ -360,6 +610,7 @@ static bool use_legacy_clean_blob_query(void)
 
 static bool clean_policydb_redirect_supported(void)
 {
+
     /*
      * 4.14 reference basis:
      *   - https://github.com/balgxmr/kernel_xiaomi_cepheus/tree/sixteen
@@ -386,6 +637,25 @@ static bool clean_policydb_redirect_supported(void)
       * path. Kernels older than this baseline do not install policydb hooks.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
+}
+
+/*
+ * Bisect build (-DSELINUX_DIAG_NO_REDIRECT=1).
+ *
+ * Keeps every hook installed exactly as the normal build does, but disables
+ * everything the hooks do: no clean-policydb snapshot, no clean-eval scope, no
+ * policydb argument rewrite.  That separates "having the hooks installed" from
+ * "redirecting the caller onto the clean policydb", which the coarser first
+ * attempt could not: there the hooks were skipped outright, so the survival of
+ * the device only ruled out the load/commit/status-page paths.
+ */
+static bool clean_redirect_active(void)
+{
+#if SELINUX_DIAG_NO_REDIRECT
+    return false;
+#else
+    return true;
+#endif
 }
 
 static bool selinux_compat_call_needed(void)
@@ -922,6 +1192,15 @@ static void activate_clean_policy_blob(const char *reason)
 
 static void snapshot_clean_policy(const char *reason)
 {
+    if (!clean_redirect_active()) {
+        /* Bisect build: never build a clean policydb, nothing can redirect. */
+        (void)reason;
+        return;
+    }
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG snapshot-IN reason=%s uid=%d comm=%s\n",
+            reason ?: "(null)", (int)current_uid(), current_comm());
+#endif
     if (READ_ONCE(g_clean_policy_blob))
         return;
     if (READ_ONCE(g_dirty_policy_seen))
@@ -1047,6 +1326,10 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
 
 static void before_security_load_policy(hook_fargs4_t *a, void *u)
 {
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG load_policy-IN uid=%d comm=%s\n",
+            (int)current_uid(), current_comm());
+#endif
     if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
         return;
 
@@ -1063,6 +1346,10 @@ static void before_security_load_policy(hook_fargs4_t *a, void *u)
 
 static void after_security_load_policy(hook_fargs4_t *a, void *u)
 {
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG load_policy-OUT ret=%ld\n",
+            a ? (long)a->ret : -1L);
+#endif
     if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
         return;
     if (a && (long)a->ret)
@@ -1076,6 +1363,26 @@ static void after_security_load_policy(hook_fargs4_t *a, void *u)
 static bool contains_magisk(const char *s, size_t len)
 {
     return contains_case_literal(s, len, "magisk");
+}
+
+/*
+ * Contexts that only exist because something patched the live policy.  The
+ * clean policy does not know any of them, so a probe naming one must fail the
+ * same way it would on a stock device: -EINVAL from the context parser.
+ */
+static bool names_privileged_context(const char *s, size_t len)
+{
+    if (!s || !len)
+        return false;
+
+    return contains_case_literal(s, len, "magisk") ||
+           contains_case_literal(s, len, "lsposed") ||
+           contains_case_literal(s, len, "xposed") ||
+           contains_case_literal(s, len, "ksu_file") ||
+           contains_case_literal(s, len, "droidspaces") ||
+           contains_case_literal(s, len, "msd_app") ||
+           contains_case_literal(s, len, "msd_daemon") ||
+           contains_case_literal(s, len, "adbroot");
 }
 
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len)
@@ -1158,6 +1465,17 @@ static bool enter_clean_eval_scope(void)
     u32 depth;
     bool entered = false;
 
+#if SELINUX_DIAG_SNAPSHOT_ONLY
+    /*
+     * Bisect level 3 (-DSELINUX_DIAG_SNAPSHOT_ONLY=1): the clean policydb is
+     * still snapshotted exactly like the normal build, but no task ever enters
+     * a clean-eval scope, so context_struct_compute_av() is never handed the
+     * clean policydb.  Separates the snapshot itself from the redirect.
+     */
+    return false;
+#endif
+    if (!clean_redirect_active())
+        return false;
     if (!clean_policydb_redirect_supported())
         return false;
     if (!READ_ONCE(g_clean_policydb))
@@ -1267,7 +1585,19 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     void *clean_policydb = READ_ONCE(g_clean_policydb);
     bool bypass = should_bypass_clean_filter(current_uid());
 
+#if SELINUX_DIAG_TRACE
+    diag_av_tick();
+#endif
+#if SELINUX_DIAG_WATCHDOG
+    WRITE_ONCE(g_diag_progress, READ_ONCE(g_diag_progress) + 1);
+#endif
+
     if (!clean_policydb_redirect_supported())
+        return;
+
+    /* Bisect build: the hook stays installed and fires, but never redirects
+     * and never snapshots a clean policy. */
+    if (!clean_redirect_active())
         return;
 
     if (bypass)
@@ -1279,6 +1609,10 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
      * remain observational and keep using the live policydb.
      */
     if (current_in_clean_eval_scope() && clean_policydb) {
+#if SELINUX_DIAG_TRACE
+        pr_info("[selinux_hook] DIAG av-redirect uid=%d comm=%s live=%px clean=%px\n",
+                (int)current_uid(), current_comm(), policydb, clean_policydb);
+#endif
         a->arg0 = (uint64_t)clean_policydb;
         return;
     }
@@ -1294,7 +1628,10 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!READ_ONCE(g_first_policydb)) {
         WRITE_ONCE(g_first_policydb, policydb);
         selinux_hook_dbg("[selinux_hook] SAVED first policydb @ %px\n", g_first_policydb);
+#if !SELINUX_ASYNC_SNAPSHOT
+        /* Sleeping file I/O inside security_compute_av()'s RCU read section. */
         snapshot_clean_policy("first_compute_av");
+#endif
         return;
     }
 
@@ -1332,6 +1669,11 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG access-IN #%u uid=%d comm=%s size=%zu query=\"%s\"\n",
+            n, (int)uid, current_comm(), size, sample);
+#endif
+
     /* Run the original selinuxfs write handler under the current task's clean scope. */
     a->local.data0 = 3;
     a->local.data1 = n;
@@ -1368,6 +1710,11 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
+
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG context-IN #%u uid=%d comm=%s size=%zu query=\"%s\"\n",
+            n, (int)uid, current_comm(), size, sample);
+#endif
 
     a->local.data1 = n;
     slot = n & (ACCESS_PROBE_SLOTS - 1);
@@ -1508,6 +1855,14 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 
     a->local.data0 = 0;
 
+#if SELINUX_DIAG_TRACE
+    a->local.data1 = diag_next();
+    pr_info("[selinux_hook] DIAG setprocattr-IN #%llu uid=%d comm=%s name=%s size=%zu bypass=%d\n",
+            (unsigned long long)a->local.data1, (int)uid, current_comm(),
+            name ?: "(null)", (size_t)a->arg2,
+            should_bypass_clean_filter(uid) ? 1 : 0);
+#endif
+
     n = READ_ONCE(g_selinux_setprocattr_probe_count);
     if (n < 16) {
         n++;
@@ -1520,14 +1875,40 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
     if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
         return;
 
-    if (enter_clean_eval_scope())
-        a->local.data0 = 1;
+    /*
+     * Do NOT enter a clean-eval scope here any more.
+     *
+     * Entering one made context_struct_compute_av() evaluate a live scontext
+     * (the caller's current SID) against a tcontext parsed out of the clean
+     * policydb.  That is exactly the call that killed the device at ~38.8 s in
+     * every boot with the redirect enabled -- always immediately after the
+     * first attr/current write from the Magisk manager -- while the same call
+     * ran 11,606 times per boot without incident once the redirect was off.
+     *
+     * The clean policy's answer for these writes is simply "that context does
+     * not exist", so return it directly, before the kernel parses or evaluates
+     * anything.
+     */
+    if (names_privileged_context((const char *)a->arg1, (size_t)a->arg2)) {
+        a->ret = (uint64_t)(long)-EINVAL;
+        a->skip_origin = 1;
+#if SELINUX_DIAG_TRACE
+        pr_info("[selinux_hook] DIAG setprocattr-deny uid=%d comm=%s value=\"%.*s\"\n",
+                (int)uid, current_comm(), (int)(size_t)a->arg2,
+                (const char *)a->arg1);
+#endif
+    }
 }
 
 static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
     if (a->local.data0)
         leave_clean_eval_scope();
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG setprocattr-OUT #%llu ret=%ld scope=%d\n",
+            (unsigned long long)a->local.data1, (long)a->ret,
+            (int)a->local.data0);
+#endif
 }
 
 /*
@@ -1542,6 +1923,11 @@ static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u)
 
     if (should_bypass_clean_filter(current_uid()))
         return;
+
+#if SELINUX_DIAG_TRACE
+    pr_info("[selinux_hook] DIAG statuspage-IN uid=%d comm=%s\n",
+            (int)current_uid(), current_comm());
+#endif
 
     if (!g_fake_status_page || !vmalloc_to_page_fn)
         return;
@@ -1773,11 +2159,30 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     selinux_hook_dbg("[selinux_hook] %d hooks installed\n", g_hooks);
+
+#if SELINUX_ASYNC_SNAPSHOT
+    start_clean_snapshot_thread();
+#endif
+
+#if SELINUX_DIAG_WATCHDOG
+    diag_watchdog_start();
+#endif
+
     return 0;
 }
 
 static long exit_(void *__user r)
 {
+#if SELINUX_ASYNC_SNAPSHOT
+    /* The snapshot thread runs code in module memory; stop it before unload. */
+    WRITE_ONCE(g_snapshot_stop, true);
+#endif
+#if SELINUX_DIAG_WATCHDOG
+    /* The watchdog thread lives in module memory; stop it before unload. */
+    WRITE_ONCE(g_watchdog_stop, true);
+    if (g_msleep_fn)
+        g_msleep_fn(1000);
+#endif
     uninstall_inline_hooks();
 
     /*
