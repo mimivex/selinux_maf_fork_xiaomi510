@@ -1,4 +1,4 @@
-SELINUX_VERSION := 1.1.9.1
+SELINUX_VERSION := 1.1.9.2
 
 ifndef KP_DIR
     KP_DIR = ../KernelPatch

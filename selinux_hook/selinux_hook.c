@@ -25,7 +25,7 @@
 #include <kputils.h>
 
 KPM_NAME("selinux_MAF_fork");
-KPM_VERSION("1.1.9.1");
+KPM_VERSION("1.1.9.2");
 KPM_LICENSE("GPL v3");
 KPM_AUTHOR("Admire, 741afb7");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
@@ -392,19 +392,32 @@ static bool selinux_compat_call_needed(void)
 {
     /*
      * 4.14 参考源码里的 security_context_to_sid() 需要
-     * struct selinux_state * 作为第一个参数。这里用 selinux_state
-     * 作为运行时信号，避免在没有 stateful ABI 的旧内核上误传参数。
+     * struct selinux_state * 作为第一个参数。
      *
-     * security_context_to_sid() is stateful on the 4.14 sources listed above.
-     * Keep the state argument through the Android common stateful era, and stop
-     * before the newer 6.4+ LSM refactors where this KPM has not been audited.
+     * 不能依赖 g_selinux_state 符号是否可见。小米 4.19 魔改内核
+     * (cepheus/sm8150) 裁剪了 selinux_state 全局符号，但 SELinux 仍是
+     * stateful ABI（security_load_policy/selinux_policy_commit 等仍带
+     * struct selinux_state * 首参）。KernelPatch 官方
+     * selinux_need_call_compat() 也只看 kver 区间（4.17-6.4）。
+     *
+     * Do not gate on g_selinux_state: a kernel can strip the symbol while
+     * keeping the stateful ABI. Keep the state argument through the Android
+     * common stateful era, and stop before the newer 6.4+ LSM refactors where
+     * this KPM has not been audited.
      */
-	return g_selinux_state && selinux_state_arg_required();
+    return selinux_state_arg_required();
 }
 
 static bool selinux_state_arg_required(void)
 {
-    return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+    /*
+     * 对齐 KernelPatch 官方 selinux_need_call_compat()：
+     *   kver >= 4.17 && kver < 6.4
+     * 4.17 起 SELinux 全面 stateful（security_load_policy/
+     * selinux_policy_commit 等带 struct selinux_state * 首参）。此判断只看
+     * 内核版本，不依赖 selinux_state 符号是否在 kallsyms 可见。
+     */
+    return kver >= VERSION(4, 17, 0) && kver < VERSION(6, 4, 0);
 }
 
 struct symbol_cache_entry {
@@ -914,6 +927,18 @@ static void snapshot_clean_policy(const char *reason)
     if (READ_ONCE(g_dirty_policy_seen))
         return;
 
+    /*
+     * 只尝试 Magisk 策略文件快照，不主动调用 security_read_policy()。
+     *
+     * 小米 4.19 魔改内核裁剪了 selinux_state 符号，本模块通过
+     * kallsyms 解析不到它。stateful 的 security_read_policy(state, ...)
+     * 会解引用首参（反汇编可见 ldr x23,[x0,#0x18]），以 NULL state 调用
+     * 会触发 NULL 解引用 panic，导致启动卡在第一屏。
+     *
+     * 干净策略改由 finish_deferred_policy_capture() 在
+     * security_load_policy() 的 after 阶段捕获参数获得（boot 早期
+     * 第一次加载的就是系统初始干净策略）。
+     */
     if (!snapshot_magisk_policy_file(reason, true))
         return;
 
@@ -931,7 +956,12 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     if (READ_ONCE(g_dirty_policy_seen))
         return false;
 
-    if (snapshot_magisk_policy_file(stage, true)) {
+    /*
+     * hook 路径（a != NULL）不尝试文件快照：security_load_policy 调用
+     * 时执行 filp_open 有锁序/阻塞风险，且 APatch 上该文件本就不存在。
+     * 文件快照只在非 hook 路径（snapshot_clean_policy）尝试。
+     */
+    if (!a && snapshot_magisk_policy_file(stage, true)) {
         activate_clean_policy_blob(stage);
         return READ_ONCE(g_clean_policy_blob) != NULL;
     }
@@ -945,19 +975,25 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     if (!a)
         return false;
 
+    /*
+     * 参数布局：小米 4.19 魔改内核裁剪了 selinux_state 符号，但
+     * security_load_policy() 仍是 stateful 签名 (state, data, len, load_state)。
+     * selinux_compat_call_needed() 修正后（4.17-6.4 stateful），compat 路径
+     * 直接按 (state, data, len) 取参。非 compat（legacy 内核）按
+     * (data, len, load_state) 取参，失败时再试 stateful 布局兜底。
+     */
     if (selinux_compat_call_needed()) {
         data = (void *)a->arg1;
         len = (size_t)a->arg2;
     } else {
         data = (void *)a->arg0;
         len = (size_t)a->arg1;
-		if (len > MAGISK_POLICY_MAX_SIZE || !len || !data)
-		{
-			/* Some devices use stateful layouts but do not export the `selinux_state` symbol; 
-			 * this execution branch is intended to address this situation. */
-			data = (void *)a->arg1;
-			len = (size_t)a->arg2;
-		}
+        if (!data || !len || len > MAGISK_POLICY_MAX_SIZE) {
+            /* Some devices use stateful layouts but do not export the
+             * `selinux_state` symbol; this branch handles that case. */
+            data = (void *)a->arg1;
+            len = (size_t)a->arg2;
+        }
     }
 
     if (!data || !len || len > MAGISK_POLICY_MAX_SIZE || !vmalloc_fn) {
@@ -985,6 +1021,22 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     }
 
     WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
+
+    /*
+     * 拒绝含 magisk 字符串的策略：APatch/folkpatch 的 apd 在 post-fs-data
+     * 阶段把规则合入策略后调用 security_load_policy，此时参数已是 dirty
+     * 策略。如果捕获到这种 blob，把它当干净策略只会让后续重定向失效。
+     * boot 早期第一次加载的系统初始策略不含这些 token，若这都含 magisk
+     * 说明厂商 ROM 本身带 magisk 规则，此时放弃捕获更安全。
+     */
+    if (READ_ONCE(g_clean_policy_has_magisk)) {
+        pr_warn("[selinux_hook] CLEAN policy capture rejected stage=%s: blob contains magisk token, keeping live policy\n",
+                stage ?: "security_load_policy");
+        if (vfree_fn)
+            vfree_fn(data);
+        return false;
+    }
+
     WRITE_ONCE(g_clean_policy_len, len);
     WRITE_ONCE(g_clean_policy_blob, data);
     pr_warn("[selinux_hook] CLEAN policy captured from security_load_policy args stage=%s blob=%px len=%zu has_magisk=%d\n",
@@ -998,6 +1050,12 @@ static void before_security_load_policy(hook_fargs4_t *a, void *u)
     if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
         return;
 
+    /*
+     * before 阶段不抓参数也不做文件快照：security_load_policy 持有
+     * policy 锁，此时做 filp_open 文件 IO 或 vmalloc 复制可能死锁。
+     * 参数捕获放到 after 阶段（allow_fallback=true），此时锁已释放；
+     * 文件快照只在非 hook 路径（snapshot_clean_policy）尝试。
+     */
     g_policy_capture_in_progress = true;
     finish_deferred_policy_capture(a, "before_security_load_policy", false);
     g_policy_capture_in_progress = false;

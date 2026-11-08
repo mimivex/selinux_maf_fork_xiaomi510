@@ -5,6 +5,11 @@ selinux_MAF_fork is supported on:
 - Linux 4.19 or later
 - Some Linux 4.14 kernels (reference: 4.14.180 or later)
 
+Kernels that strip the `selinux_state` symbol from kallsyms (for example
+Xiaomi 4.19 vendor kernels) are supported: the stateful SELinux ABI is
+detected by kernel version (4.17–6.3), matching KernelPatch's
+`selinux_need_call_compat()`.
+
 For Linux 4.14 or earlier kernels, support requires the following SELinux
 layouts:
 
